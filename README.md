@@ -97,7 +97,7 @@ These results indicate that the implementation is **highly stable** and suitable
 
 This implementation includes:
 
-- **Importance estimation** using \( \sqrt{\mathbb{E}[(QK)^2]} \)  
+- **Importance estimation** using $\sqrt{\mathbb{E}[(QK^\top)^2]}$
 - **Top‑k token selection** based on importance  
 - **β log‑mass correction** to preserve attention distribution  
 - **Ridge regression** to reconstruct compressed values  
