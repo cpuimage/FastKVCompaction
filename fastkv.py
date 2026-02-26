@@ -12,122 +12,249 @@ class FastKVCompaction:
     https://arxiv.org/abs/2602.16284v1
     """
 
-    def __init__(self, compression_ratio=10.0, chunk_size=4096, lambda_scale_factor=5e-5):
+    def __init__(
+            self,
+            compression_ratio: float = 10.0,
+            lambda_scale_factor: float = 5e-6,
+            min_compression_length: int = 256,
+            importance_r_chunk: int = 64,
+            logmass_l_chunk: int = 512,
+            sink_size: int = 16,
+            residual_size: int = 128,
+            lambda_ratio_ref: float = 10.0,
+    ):
+        # Controls how aggressively we compress the KV cache.
         self.compression_ratio = compression_ratio
-        self.chunk_size = chunk_size
+
+        # Base scale for ridge regression regularization.
+        # Smaller λ → less shrinkage → lower bias but more numerical risk.
         self.lambda_scale_factor = lambda_scale_factor
+
+        # Minimum number of tokens to keep regardless of ratio.
+        self.min_compression_length = min_compression_length
+
+        # Chunk sizes for computing importance and log‑mass in streaming fashion.
+        self.importance_r_chunk = importance_r_chunk
+        self.logmass_l_chunk = logmass_l_chunk
+
+        # Sink tokens are always preserved (e.g., BOS tokens).
+        self.sink_size = sink_size
+
+        # Reserved for potential tail‑preservation logic (not used here).
+        self.residual_size = residual_size
+
+        # Controls how λ decays with compression severity.
+        self.lambda_ratio_ref = lambda_ratio_ref
+
+    @staticmethod
+    def _process_mask(attn_mask: torch.Tensor, B: int, H_kv: int, L: int):
+        """
+        Normalize attention mask into shape [BH, L].
+        Supports:
+            [B, L]
+            [B, 1, L]
+            [B, H_kv, L]
+            [B, H_kv, 1, L]
+        """
+        if attn_mask is None:
+            return None
+
+        # Convert non‑boolean masks to boolean.
+        if attn_mask.dtype != torch.bool:
+            mask = (attn_mask > 0)
+        else:
+            mask = attn_mask
+
+        # Expand to [B, H_kv, L]
+        if mask.dim() == 2:
+            mask = mask.unsqueeze(1).expand(-1, H_kv, -1)
+        elif mask.dim() == 3:
+            if mask.size(1) == 1:
+                mask = mask.expand(B, H_kv, -1)
+        elif mask.dim() == 4:
+            mask = mask[:, :, -1, :]  # last query position
+
+        return mask.reshape(B * H_kv, L)
 
     @torch.no_grad()
     def compact(self, K, V, Q_ref, attn_mask=None):
         """
-        K: [B, H_kv, L, D]
-        V: [B, H_kv, L, D]
-        Q_ref: [R, D] — reference queries
-        attn_mask: [B, H_kv, L] / [B, 1, L] / [B, L]
-                   True = keep, False = masked
+        Main compaction routine.
 
-        Returns:
-            C_k:  [B, H_kv, Lc, D] — compressed keys
-            C_v:  [B, H_kv, Lc, D] — compressed values
-            beta: [B, H_kv, Lc]    — log-mass correction
+        Inputs:
+            K, V: [B, H_kv, L, D] — original KV cache
+            Q_ref: reference queries used to measure importance
+            attn_mask: optional boolean mask
+
+        Outputs:
+            C_k: compressed keys  [B, H_kv, Lc, D]
+            C_v: compressed values [B, H_kv, Lc, D]
+            beta: log‑mass correction [B, H_kv, Lc]
         """
         B, H_kv, L, D = K.shape
-        R = Q_ref.size(0)
         device = K.device
+        dtype = K.dtype
+        scale = D ** -0.5
         BH = B * H_kv
 
-        # Flatten KV heads into [BH, L, D]
-        Kf = K.reshape(BH, L, D).float()
-        Qf = Q_ref.unsqueeze(0).unsqueeze(0).expand(B, H_kv, R, D).reshape(BH, R, D)
+        # ------------------------------------------------------------
+        # 1) Determine compression budget
+        # ------------------------------------------------------------
+        budget = max(self.min_compression_length, int(L / self.compression_ratio))
+        if budget >= L:
+            # No compression needed
+            beta = torch.zeros(B, H_kv, L, device=device, dtype=dtype)
+            return K, V, beta
 
-        # Normalize attention mask to [BH, L]
-        if attn_mask is not None:
-            if attn_mask.dim() == 3:  # [B, H_kv, L] or [B, 1, L]
-                if attn_mask.size(1) == 1:
-                    attn_mask = attn_mask.expand(B, H_kv, L)
-                attn_mask_f = attn_mask.reshape(BH, L)
-            elif attn_mask.dim() == 2:  # [B, L]
-                attn_mask_f = attn_mask.unsqueeze(1).expand(B, H_kv, L).reshape(BH, L)
-            else:
-                raise ValueError("Unsupported attn_mask shape")
-            attn_mask_f = attn_mask_f.to(torch.bool)
+        # ------------------------------------------------------------
+        # 2) Normalize Q_ref → [BH, R, D]
+        # ------------------------------------------------------------
+        if Q_ref.dim() == 2:
+            R = Q_ref.size(0)
+            Q_flat = Q_ref.float().view(1, 1, R, D).expand(B, H_kv, R, D).reshape(BH, R, D)
+        elif Q_ref.dim() == 3:
+            R = Q_ref.size(1)
+            Q_flat = Q_ref.float().unsqueeze(1).expand(B, H_kv, R, D).reshape(BH, R, D)
         else:
-            attn_mask_f = None
+            R = Q_ref.size(2)
+            Q_flat = Q_ref.float().reshape(BH, R, D)
 
-        scale = D ** -0.5
+        # Convert K/V to float32 for stable math
+        K_f32 = K.float()
+        V_f32 = V.float()
+        K_flat = K_f32.reshape(BH, L, D)
 
-        # 1) Importance = sqrt(mean((QK)^2))
-        scores = torch.bmm(Qf, Kf.transpose(-1, -2)) * scale  # [BH, R, L]
-        importance = scores.pow(2).mean(dim=1).sqrt()  # [BH, L]
+        # Process mask → [BH, L]
+        mask_flat = self._process_mask(attn_mask, B, H_kv, L)
+        valid_mask = torch.ones(BH, L, device=device, dtype=torch.bool) if mask_flat is None else mask_flat
 
-        if attn_mask_f is not None:
-            importance = importance.masked_fill(~attn_mask_f, float("-inf"))
+        # ------------------------------------------------------------
+        # 3) Importance estimation
+        #    importance = mean(|QK|) over reference queries
+        # ------------------------------------------------------------
+        importance = torch.zeros(BH, L, device=device, dtype=torch.float32)
+        r_chunk = self.importance_r_chunk or R
+        K_t = K_flat.transpose(-1, -2)
 
-        # 2) Top-k selection
-        budget = max(1, int(L / self.compression_ratio))
-        _, idx = torch.topk(importance, budget, dim=-1)
-        batch_idx = torch.arange(BH, device=device).view(-1, 1)
+        for r_start in range(0, R, r_chunk):
+            r_end = min(R, r_start + r_chunk)
+            Qc = Q_flat[:, r_start:r_end, :]
+            scores = torch.bmm(Qc, K_t) * scale  # [BH, r_chunk, L]
 
-        C_k = Kf[batch_idx, idx]  # [BH, Lc, D]
+            if mask_flat is not None:
+                scores = scores.masked_fill(~valid_mask.unsqueeze(1), 0.0)
 
-        # 3) Compute original attention output Y for fitting C_v
-        if attn_mask is not None:
-            if attn_mask.dim() == 3:
-                if attn_mask.size(1) == 1:
-                    attn_mask_q = attn_mask.expand(B, H_kv, L)
-                else:
-                    attn_mask_q = attn_mask
-            elif attn_mask.dim() == 2:
-                attn_mask_q = attn_mask.unsqueeze(1).expand(B, H_kv, L)
-            else:
-                raise ValueError("Unsupported attn_mask shape")
-            attn_mask_q = attn_mask_q.unsqueeze(2)  # [B, H_kv, 1, L]
-            attn_mask_q = attn_mask_q.to(torch.bool)
+            # Stable importance metric
+            importance += torch.mean(torch.abs(scores), dim=1)
+
+        # Always keep sink tokens
+        if self.sink_size > 0:
+            importance[:, :self.sink_size] = 1e10
+
+        importance = importance.masked_fill(~valid_mask, float("-inf"))
+
+        # ------------------------------------------------------------
+        # 4) Top‑K selection
+        # ------------------------------------------------------------
+        _, topk_idx = torch.topk(importance, budget, dim=-1, sorted=False)
+        batch_idx = torch.arange(BH, device=device).unsqueeze(-1)
+        C_k = K_flat[batch_idx, topk_idx]  # [BH, Lc, D]
+
+        # ------------------------------------------------------------
+        # 5) Compute original log‑mass via streaming log‑sum‑exp
+        # ------------------------------------------------------------
+        def online_lse(cur, new):
+            """
+            Numerically stable streaming log‑sum‑exp:
+                cur = logsumexp(previous_chunks)
+                new = scores for current chunk
+            """
+            m1 = cur
+            m2, _ = torch.max(new, dim=-1)
+            m = torch.maximum(m1, m2)
+            return m + torch.log(
+                torch.exp(m1 - m) +
+                torch.sum(torch.exp(new - m.unsqueeze(-1)), dim=-1)
+            )
+
+        log_mass_orig = torch.full((BH, R), float("-inf"), device=device)
+        l_chunk = self.logmass_l_chunk or L
+
+        for l_start in range(0, L, l_chunk):
+            l_end = min(L, l_start + l_chunk)
+            K_l = K_flat[:, l_start:l_end, :]
+            scores_l = torch.bmm(Q_flat, K_l.transpose(-1, -2)) * scale
+
+            if mask_flat is not None:
+                scores_l = scores_l.masked_fill(
+                    ~valid_mask[:, l_start:l_end].unsqueeze(1),
+                    float("-inf"),
+                )
+
+            log_mass_orig = online_lse(log_mass_orig, scores_l)
+        if mask_flat is not None:
+            sdpa_mask = valid_mask.view(B, H_kv, L).unsqueeze(2).expand(-1, -1, R, -1)
         else:
-            attn_mask_q = None
+            sdpa_mask = None
 
-        Y = torch.nn.functional.scaled_dot_product_attention(
-            Qf.view(B, H_kv, R, D),
-            K,
-            V,
-            attn_mask=attn_mask_q
+        Y_full = F.scaled_dot_product_attention(
+            Q_flat.view(B, H_kv, R, D),
+            K_f32,
+            V_f32,
+            attn_mask=sdpa_mask,
         ).reshape(BH, R, D)
 
-        # 4) Log-mass correction β
-        if attn_mask_f is not None:
-            scores_for_mass = scores.masked_fill(
-                ~attn_mask_f.unsqueeze(1), float("-inf")
-            )
-        else:
-            scores_for_mass = scores
+        # ------------------------------------------------------------
+        # 6) Compute compressed log‑mass
+        # ------------------------------------------------------------
+        log_mass_comp = torch.empty(BH, R, device=device)
+        for i in range(BH):
+            Qi = Q_flat[i]
+            Cki = C_k[i]
+            scores_ci = (Qi @ Cki.transpose(-1, -2)) * scale
+            log_mass_comp[i] = torch.logsumexp(scores_ci, dim=-1)
 
-        scores_c = torch.bmm(Qf, C_k.transpose(-1, -2)) * scale  # [BH, R, Lc]
+        # β = median(log_mass_orig − log_mass_comp)
+        diff = log_mass_orig - log_mass_comp
+        beta_per_head = diff.median(dim=1, keepdim=True).values
+        beta = beta_per_head.expand(-1, budget).view(B, H_kv, budget).to(dtype)
 
-        log_mass_orig = torch.logsumexp(scores_for_mass, dim=-1, keepdim=True)
-        log_mass_comp = torch.logsumexp(scores_c, dim=-1, keepdim=True)
+        # ------------------------------------------------------------
+        # 7) Ridge regression to fit compressed values C_v
+        # ------------------------------------------------------------
+        C_v = torch.empty(BH, budget, D, device=device)
 
-        beta = (log_mass_orig - log_mass_comp).median(dim=1).values  # [BH, 1]
-        beta = beta.expand(-1, budget)  # [BH, Lc]
+        # Compression severity controls λ decay
+        severity = max(self.compression_ratio / self.lambda_ratio_ref, 1.0)
+        effective_lambda = self.lambda_scale_factor / (severity * severity)
 
-        # 5) Solve for C_v using ridge regression
-        X = torch.softmax(scores_c + beta.unsqueeze(1), dim=-1)  # [BH, R, Lc]
-        lambda_scale = self.lambda_scale_factor * X.abs().mean(dim=(1, 2), keepdim=True)
+        I = None
 
-        if budget > R:
-            XXt = torch.bmm(X, X.transpose(-1, -2))
-            reg = lambda_scale * torch.eye(R, device=device).expand(BH, -1, -1)
-            mid = torch.linalg.solve(XXt + reg, Y)
-            C_v = torch.bmm(X.transpose(-1, -2), mid)
-        else:
-            XtX = torch.bmm(X.transpose(-1, -2), X)
-            reg = lambda_scale * torch.eye(budget, device=device).expand(BH, -1, -1)
-            XtY = torch.bmm(X.transpose(-1, -2), Y)
-            C_v = torch.linalg.solve(XtX + reg, XtY)
+        for i in range(BH):
+            Qi = Q_flat[i]
+            Cki = C_k[i]
 
-        # Reshape back to KV heads
-        C_k = C_k.reshape(B, H_kv, budget, D)
-        C_v = C_v.reshape(B, H_kv, budget, D)
-        beta = beta.reshape(B, H_kv, budget)
+            # Attention weights under compressed keys
+            s_i = (Qi @ Cki.transpose(-1, -2)) * scale
+            b_i = beta_per_head[i]
+            W = torch.softmax(s_i + b_i.unsqueeze(0), dim=-1)
+
+            Xt = W.transpose(-1, -2)
+            XtX = Xt @ W
+            XtY = Xt @ Y_full[i]
+
+            if I is None or I.size(0) != budget:
+                I = torch.eye(budget, device=device)
+
+            trace = torch.diagonal(XtX).sum()
+            lam = effective_lambda * trace / max(budget, 1) + 1e-9
+
+            # Solve (XtX + λI) C_v = XtY
+            C_v[i] = torch.linalg.solve(XtX + lam * I, XtY)
+
+        # Reshape back to [B, H_kv, Lc, D]
+        C_k = C_k.view(B, H_kv, budget, D).to(dtype)
+        C_v = C_v.view(B, H_kv, budget, D).to(dtype)
 
         return C_k, C_v, beta
 
@@ -358,7 +485,6 @@ def test_attention_module():
 
     compactor = FastKVCompaction(
         compression_ratio=10.0,
-        chunk_size=256,
     )
 
     attn = Attention(
@@ -422,7 +548,7 @@ def test_attention_usage():
         attn_mask=attn_mask.unsqueeze(2)
     )
 
-    compactor = FastKVCompaction(compression_ratio=20.0, chunk_size=256)
+    compactor = FastKVCompaction(compression_ratio=20.0)
     C_k, C_v, beta = compactor.compact(K, V, Q_ref, attn_mask=attn_mask)
 
     compact_mask = torch.ones(
@@ -478,7 +604,7 @@ def test_segmented_compaction():
     old_mask = attn_mask[:, :, :split_pos]
     new_mask = attn_mask[:, :, split_pos:]
 
-    compactor = FastKVCompaction(compression_ratio=20.0, chunk_size=256)
+    compactor = FastKVCompaction(compression_ratio=20.0)
 
     C_k, C_v, beta = compactor.compact(old_K, old_V, Q_ref, attn_mask=old_mask)
 

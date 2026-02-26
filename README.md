@@ -33,7 +33,7 @@ from fastkv import FastKVCompaction
 
 compactor = FastKVCompaction(
     compression_ratio=10.0,
-    lambda_scale_factor=5e-5,
+    lambda_scale_factor=5e-6,
 )
 ```
 
@@ -74,19 +74,19 @@ out, past = attn(x, cos, sin, use_cache=True, past_key_value=past_kv)
 
 | Config                                  | Compression | Relative Error | Cosine |
 |--------|-------------|----------------|--------|
-| B=1, H=32, L=32768, D=128 | 10× | **0.31%** | **0.999999** |
-| B=1, H=32, L=65536, D=128 | 10× | **0.32%** | **1.000002** |
-| B=1, H=32, L=32768, D=128 | 20× | **0.32%** | **1.000000** |
-| B=1, H=32, L=65536, D=128 | 20× | **0.32%** | **1.000001** |
+| B=1, H=32, L=32768, D=128 | 10× | **0.06%** | **1.000000** |
+| B=1, H=32, L=65536, D=128 | 10× | **0.08%** | **1.000000** |
+| B=1, H=32, L=32768, D=128 | 20× | **3.27%** | **0.999467** |
+| B=1, H=32, L=65536, D=128 | 20× | **0.06%** | **1.000000** |
 
 ### Single‑segment attention
 
-- Relative Error: **0.0016%**  
+- Relative Error: **0.0000%**  
 - Cosine Similarity: **1.000000**
 
 ### Segmented attention (steady‑state)
 
-- Relative Error: **0.0017%**  
+- Relative Error: **0.0000%**  
 - Cosine Similarity: **1.000000**
 
 These results indicate that the implementation is **highly stable** and suitable for real LLM inference workloads.
