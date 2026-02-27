@@ -14,13 +14,12 @@ The implementation is designed for **practical integration into LLM inference**,
 ## 🚀 Features
 
 - **High‑fidelity KV cache compression** with <0.002% error in real attention paths  
-- **Mask‑aware importance selection**  
-- **Log‑mass β correction** for attention mass preservation  
-- **Ridge regression** for stable value reconstruction  
-- **Sliding‑window incremental compression** for autoregressive decoding  
-- **Drop‑in replacement Attention module** with compaction support  
-- **Supports extremely long KV caches** (32k–100k+)  
-- **Compatible with PyTorch 2.x SDPA**
+- **Mask‑aware importance selection** supporting multiple mask formats (`[B, L]`, `[B, H_kv, L]`, etc.)  
+- **Log‑mass β correction** for attention mass preservation across compressed tokens  
+- **Adaptive ridge regression** with severity-based regularization for stable value reconstruction  
+- **Sink token preservation** (e.g., BOS tokens) to maintain attention stability  
+- **Streaming computation** for importance estimation and log‑mass calculation (memory-efficient)  
+- **Compatible with PyTorch 2.x SDPA** and GQA/MQA attention patterns
 
 ---
 
@@ -32,15 +31,25 @@ The implementation is designed for **practical integration into LLM inference**,
 from fastkv import FastKVCompaction
 
 compactor = FastKVCompaction(
-    compression_ratio=10.0,
-    lambda_scale_factor=5e-6,
+    compression_ratio=10.0,        # Target compression ratio
+    lambda_scale_factor=5e-6,      # Base regularization strength
+    min_compression_length=256,    # Minimum tokens to preserve
+    sink_size=16,                  # Always preserve first N tokens
+    importance_r_chunk=64,         # Chunk size for importance computation
+    logmass_l_chunk=512,           # Chunk size for log‑mass streaming
 )
 ```
 
 ### 2. Compress KV cache
 
 ```python
+# K, V: [B, H_kv, L, D] - original KV cache
+# Q_ref: [R, D] or [B, R, D] or [B, H_kv, R, D] - reference queries
+# attn_mask: Optional, supports [B, L], [B, H_kv, L], [B, H_kv, 1, L]
+
 C_k, C_v, beta = compactor.compact(K, V, Q_ref, attn_mask)
+# C_k, C_v: [B, H_kv, Lc, D] - compressed KV cache
+# beta: [B, H_kv, Lc] - log‑mass correction term
 ```
 
 ### 3. Use compressed KV in attention
@@ -48,62 +57,78 @@ C_k, C_v, beta = compactor.compact(K, V, Q_ref, attn_mask)
 ```python
 from fastkv import compact_attention
 
-out = compact_attention(q, C_k, C_v, beta)
+# q: [B, H, T, D] - queries (H may differ from H_kv in GQA/MQA)
+# C_k, C_v: [B, H_kv, Lc, D] - compressed KV cache
+# beta: [B, H_kv, Lc] - correction from compactor
+# attn_mask: [B, H, T, L] or broadcastable shape
+
+out = compact_attention(q, C_k, C_v, beta, attn_mask)
+# out: [B, H, T, D]
 ```
 
-### 4. Or use the integrated Attention module
+**Note on GQA/MQA**: In grouped-query attention, `H` (query heads) may be greater than `H_kv` (KV heads). The `beta` term is automatically broadcast across query heads in `compact_attention`.
+
+---
+
+## 📊 Implementation Details
+
+### Importance Estimation
+
+Unlike the paper's RMS suggestion, this implementation uses **mean absolute attention** for numerical stability:
 
 ```python
-attn = Attention(
-    num_heads=H,
-    num_kv_heads=H_kv,
-    hidden_size=hidden,
-    head_dim=D,
-    compactor=compactor,
-    window_size=8,
-)
+importance = mean(|QK^T|) over reference queries
+```
 
-out, past = attn(x, cos, sin, use_cache=True, past_key_value=past_kv)
+This provides robust importance scores while avoiding overflow risks with squared terms.
+
+### Sink Token Protection
+
+The first `sink_size` tokens (configurable, default 16) are always preserved by setting their importance to infinity:
+
+```python
+if self.sink_size > 0:
+    importance[:, :self.sink_size] = 1e10
+```
+
+This ensures critical positional information (like BOS tokens) is never compressed away.
+
+### Adaptive Regularization
+
+Ridge regression uses dynamic λ based on compression severity:
+
+```python
+severity = max(compression_ratio / lambda_ratio_ref, 1.0)
+effective_lambda = lambda_scale_factor / (severity^2)
+```
+
+Higher compression ratios → stronger regularization → more stable solutions.
+
+### Streaming Log‑Sum‑Exp
+
+Memory-efficient computation of attention mass using chunked processing:
+
+```python
+def online_lse(cur, new):
+    # Numerically stable streaming log‑sum‑exp
+    m = max(cur, max(new))
+    return m + log(exp(cur - m) + sum(exp(new - m)))
 ```
 
 ---
 
-## 📊 Benchmark Results
+## ⚠️ Important Notes
 
-### Large‑scale random stress tests
+1. **Reference Queries (`Q_ref`)**: Should be representative of the query distribution during inference. Common choices:
+   - First few tokens of the input sequence
+   - Learnable query embeddings
+   - Running average of past queries
 
-| Config                                  | Compression | Relative Error | Cosine |
-|--------|-------------|----------------|--------|
-| B=1, H=32, L=32768, D=128 | 10× | **0.06%** | **1.000000** |
-| B=1, H=32, L=65536, D=128 | 10× | **0.08%** | **1.000000** |
-| B=1, H=32, L=32768, D=128 | 20× | **3.27%** | **0.999467** |
-| B=1, H=32, L=65536, D=128 | 20× | **0.06%** | **1.000000** |
+2. **Mask Handling**: The compactor accepts flexible mask formats but requires boolean masks (True = attend, False = mask out). Non-boolean masks are converted via `(mask > 0)`.
 
-### Single‑segment attention
+3. **Numerical Precision**: Internal computations use `float32` for stability regardless of input dtype. Outputs are cast back to input dtype.
 
-- Relative Error: **0.0000%**  
-- Cosine Similarity: **1.000000**
-
-### Segmented attention (steady‑state)
-
-- Relative Error: **0.0000%**  
-- Cosine Similarity: **1.000000**
-
-These results indicate that the implementation is **highly stable** and suitable for real LLM inference workloads.
-
----
-
-## 🧠 Design Overview
-
-This implementation includes:
-
-- **Importance estimation** using $\sqrt{\mathbb{E}[(QK^\top)^2]}$
-- **Top‑k token selection** based on importance  
-- **β log‑mass correction** to preserve attention distribution  
-- **Ridge regression** to reconstruct compressed values  
-- **Mask‑aware scoring and mass computation**  
-- **Sliding‑window incremental compaction** for autoregressive decoding  
-- **Full integration into a multi‑head Attention module**
+4. **Beta Correction**: The `beta` term compensates for attention mass lost during compression. It is computed as the median difference between original and compressed log‑masses across reference queries.
 
 ---
 
@@ -131,4 +156,3 @@ MIT License.
 
 Thanks to the authors of *Fast KV Cache Compaction via Attention Matching* for introducing this elegant and practical method. 
 This repository aims to provide a clean, engineering‑ready PyTorch implementation for the community.
-
