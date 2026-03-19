@@ -1,262 +1,316 @@
+import math
 import time
+from typing import Optional, Tuple
+
 import torch
 import torch.nn.functional as F
-import math
-
 from torch import nn
 
 
 class FastKVCompaction:
     """
     Fast KV Cache Compaction via Attention Matching (Unofficial Implementation)
-    https://arxiv.org/abs/2602.16284v1
+    Original Paper: https://arxiv.org/abs/2602.16284v1
     """
 
     def __init__(
             self,
-            compression_ratio: float = 10.0,
-            lambda_scale_factor: float = 5e-6,
-            min_compression_length: int = 256,
-            importance_r_chunk: int = 64,
-            logmass_l_chunk: int = 512,
-            sink_size: int = 16,
-            residual_size: int = 128,
-            lambda_ratio_ref: float = 10.0,
+            compression_ratio=10.0,  # r = L / L_compressed
+            lambda_scale_factor=5e-6,  # λ_base: base regularization strength
+            min_compression_length=256,  # L_min: minimum compressed length
+            sink_size=16,  # n_sink: number of attention sinks to preserve
+            logmass_l_chunk=4096,  # L_chunk: chunk size for KV processing
+            chunk_R=2048,  # R_chunk: chunk size for reference queries
+            lambda_ratio_ref=10.0,  # λ_ref: reference for adaptive regularization
+            eps=5e-9  # ε: small constant for numerical stability
     ):
-        # Controls how aggressively we compress the KV cache.
         self.compression_ratio = compression_ratio
-
-        # Base scale for ridge regression regularization.
-        # Smaller λ → less shrinkage → lower bias but more numerical risk.
         self.lambda_scale_factor = lambda_scale_factor
-
-        # Minimum number of tokens to keep regardless of ratio.
         self.min_compression_length = min_compression_length
-
-        # Chunk sizes for computing importance and log‑mass in streaming fashion.
-        self.importance_r_chunk = importance_r_chunk
-        self.logmass_l_chunk = logmass_l_chunk
-
-        # Sink tokens are always preserved (e.g., BOS tokens).
         self.sink_size = sink_size
-
-        # Reserved for potential tail‑preservation logic (not used here).
-        self.residual_size = residual_size
-
-        # Controls how λ decays with compression severity.
+        self.logmass_l_chunk = logmass_l_chunk
         self.lambda_ratio_ref = lambda_ratio_ref
+        self.chunk_R = chunk_R
+        self.eps = eps
 
     @staticmethod
-    def _process_mask(attn_mask: torch.Tensor, B: int, H_kv: int, L: int):
+    def _process_mask(attn_mask, batch_size, num_kv_heads, seq_length):
         """
-        Normalize attention mask into shape [BH, L].
-        Supports:
-            [B, L]
-            [B, 1, L]
-            [B, H_kv, L]
-            [B, H_kv, 1, L]
+        Unifies various attention mask shapes into a flattened [B*H, L] format.
+        Supports shapes: (B, L), (B, 1, L), (B, H, 1, L), or (B, H, R, L).
         """
         if attn_mask is None:
             return None
-
-        # Convert non‑boolean masks to boolean.
-        if attn_mask.dtype != torch.bool:
-            mask = (attn_mask > 0)
-        else:
-            mask = attn_mask
-
-        # Expand to [B, H_kv, L]
+        mask = attn_mask if attn_mask.dtype == torch.bool else (attn_mask > 0)
         if mask.dim() == 2:
-            mask = mask.unsqueeze(1).expand(-1, H_kv, -1)
+            mask = mask.unsqueeze(1).expand(batch_size, num_kv_heads, seq_length)
         elif mask.dim() == 3:
             if mask.size(1) == 1:
-                mask = mask.expand(B, H_kv, -1)
+                mask = mask.expand(batch_size, num_kv_heads, seq_length)
         elif mask.dim() == 4:
-            mask = mask[:, :, -1, :]  # last query position
+            # Assume causal or global mask; take the last query's view
+            mask = mask[:, :, -1, :]
+        return mask.reshape(batch_size * num_kv_heads, seq_length)
 
-        return mask.reshape(B * H_kv, L)
+    @staticmethod
+    def _online_logsumexp(log_probs_prev: torch.Tensor, log_probs_chunk: torch.Tensor) -> torch.Tensor:
+        """
+        Numerically stable online Log-Sum-Exp for streaming log-mass accumulation.
+
+        Args:
+            log_probs_prev: Previous log probabilities [batch_heads, num_queries]
+            log_probs_chunk: Current chunk log probabilities [batch_heads, num_queries, chunk_size]
+
+        Returns:
+            Updated log probabilities [batch_heads, num_queries]
+        """
+        max_prev = log_probs_prev
+        max_chunk = log_probs_chunk.max(dim=-1).values
+        max_combined = torch.maximum(max_prev, max_chunk)
+        max_combined = max_combined.masked_fill(max_combined == float("-inf"), 0.0)
+
+        return max_combined + torch.log(
+            torch.exp(log_probs_prev - max_combined) +
+            torch.exp(log_probs_chunk - max_combined.unsqueeze(-1)).sum(dim=-1)
+        )
+
+    def _solve_ridge(
+            self,
+            gram_matrix: torch.Tensor,  # G = X^T X ∈ [L_c, L_c]
+            projection_matrix: torch.Tensor,  # P = X^T Y ∈ [L_c, D]
+            identity: torch.Tensor,  # I ∈ [L_c, L_c]
+            regularization: torch.Tensor,  # λ (scalar)
+            dtype: torch.dtype
+    ) -> torch.Tensor:
+        """
+        Solve ridge regression problem: (G + λI) V_opt = P
+
+        Args:
+            gram_matrix: Gram matrix G = X^T X
+            projection_matrix: Projection matrix P = X^T Y
+            identity: Identity matrix I
+            regularization: Regularization strength λ
+            dtype: Output data type
+
+        Returns:
+            Optimal value matrix V_opt with same shape as projection_matrix
+        """
+        # Regularized Gram matrix
+        G_reg = gram_matrix + regularization * identity
+        # Force symmetry to prevent numerical drift
+        G_reg = (G_reg + G_reg.T) * 0.5
+
+        try:
+            # Fast path: Cholesky decomposition (requires positive definite matrix)
+            L = torch.linalg.cholesky(G_reg)
+            V_opt = torch.cholesky_solve(projection_matrix, L).to(dtype)
+        except (torch._C._LinAlgError, RuntimeError):
+            # Robust path: General linear solver (LU decomposition)
+            V_opt = torch.linalg.solve(G_reg, projection_matrix).to(dtype)
+        return V_opt
 
     @torch.no_grad()
-    def compact(self, K, V, Q_ref, attn_mask=None):
+    def compact(
+            self,
+            key_states: torch.Tensor,  # K: [B, H, L, D]
+            value_states: torch.Tensor,  # V: [B, H, L, D]
+            reference_queries: torch.Tensor,  # Q_ref: [B, H, R, D] or [B, R, D] or [R, D]
+            attention_mask: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Main compaction routine.
+        Compress KV cache via attention matching.
 
-        Inputs:
-            K, V: [B, H_kv, L, D] — original KV cache
-            Q_ref: reference queries used to measure importance
-            attn_mask: optional boolean mask
-
-        Outputs:
-            C_k: compressed keys  [B, H_kv, Lc, D]
-            C_v: compressed values [B, H_kv, Lc, D]
-            beta: log‑mass correction [B, H_kv, Lc]
+        Returns:
+            compressed_keys: K_c [B, H, L_c, D]
+            compressed_values: V_c [B, H, L_c, D]
+            log_bias: β [B, H, L_c] (additive bias for attention scores)
         """
-        B, H_kv, L, D = K.shape
-        device = K.device
-        dtype = K.dtype
-        scale = D ** -0.5
-        BH = B * H_kv
+        batch_size, num_heads, seq_length, head_dim = key_states.shape
+        device = key_states.device
+        dtype = key_states.dtype
+        batch_heads = batch_size * num_heads
+        scale = head_dim ** -0.5
 
-        # ------------------------------------------------------------
-        # 1) Determine compression budget
-        # ------------------------------------------------------------
-        budget = max(self.min_compression_length, int(L / self.compression_ratio))
-        if budget >= L:
-            # No compression needed
-            beta = torch.zeros(B, H_kv, L, device=device, dtype=dtype)
-            return K, V, beta
+        # 1) Determine compressed length L_c ---
+        compressed_length = max(self.min_compression_length, int(seq_length / self.compression_ratio))
+        if compressed_length >= seq_length:  # Skip if already within budget
+            zero_bias = torch.zeros(batch_size, num_heads, seq_length, device=device, dtype=dtype)
+            return key_states, value_states, zero_bias
 
-        # ------------------------------------------------------------
-        # 2) Normalize Q_ref → [BH, R, D]
-        # ------------------------------------------------------------
-        if Q_ref.dim() == 2:
-            R = Q_ref.size(0)
-            Q_flat = Q_ref.float().view(1, 1, R, D).expand(B, H_kv, R, D).reshape(BH, R, D)
-        elif Q_ref.dim() == 3:
-            R = Q_ref.size(1)
-            Q_flat = Q_ref.float().unsqueeze(1).expand(B, H_kv, R, D).reshape(BH, R, D)
-        else:
-            R = Q_ref.size(2)
-            Q_flat = Q_ref.float().reshape(BH, R, D)
+        # 2) Standardize reference queries Q -> [batch_heads, num_queries, head_dim] ---
+        queries = reference_queries.float()
+        if queries.dim() == 2:  # [R, D]
+            queries = queries.view(1, 1, -1, head_dim).expand(batch_size, num_heads, -1, head_dim)
+        elif queries.dim() == 3:  # [B, R, D] or [H, R, D]
+            if queries.size(0) == batch_size:  # [B, R, D]
+                queries = queries.unsqueeze(1).expand(batch_size, num_heads, -1, head_dim)
+            else:  # [H, R, D]
+                queries = queries.unsqueeze(0).expand(batch_size, num_heads, -1, head_dim)
+        # else: [B, H, R, D] - keep as is
+        queries = queries.reshape(batch_heads, -1, head_dim)
+        num_queries = queries.size(1)  # R
 
-        # Convert K/V to float32 for stable math
-        K_f32 = K.float()
-        V_f32 = V.float()
-        K_flat = K_f32.reshape(BH, L, D)
+        # 3) Process attention mask ---
+        flat_mask = self._process_mask(attention_mask, batch_size, num_heads, seq_length)
+        valid_mask = flat_mask if flat_mask is not None else torch.ones(batch_heads, seq_length, device=device,
+                                                                        dtype=torch.bool)
 
-        # Process mask → [BH, L]
-        mask_flat = self._process_mask(attn_mask, B, H_kv, L)
-        valid_mask = torch.ones(BH, L, device=device, dtype=torch.bool) if mask_flat is None else mask_flat
+        # 4) Importance scoring s_j for each token ---
+        # Use a window of recent queries to estimate importance (memory efficient)
+        window_size = min(self.sink_size * 2, max(seq_length // 4, 1))
+        recent_queries = queries[:, -window_size:, :]
 
-        # ------------------------------------------------------------
-        # 3) Importance estimation
-        #    importance = mean(|QK|) over reference queries
-        # ------------------------------------------------------------
-        importance = torch.zeros(BH, L, device=device, dtype=torch.float32)
-        r_chunk = self.importance_r_chunk or R
-        K_t = K_flat.transpose(-1, -2)
+        # Compute attention score magnitudes as importance metric
+        attention_scores = torch.bmm(
+            recent_queries,
+            key_states.reshape(batch_heads, seq_length, head_dim).float().transpose(-1, -2)
+        ) * scale
 
-        for r_start in range(0, R, r_chunk):
-            r_end = min(R, r_start + r_chunk)
-            Qc = Q_flat[:, r_start:r_end, :]
-            scores = torch.bmm(Qc, K_t) * scale  # [BH, r_chunk, L]
+        if flat_mask is not None:
+            attention_scores = attention_scores.masked_fill(~valid_mask.unsqueeze(1), 0.0)
 
-            if mask_flat is not None:
-                scores = scores.masked_fill(~valid_mask.unsqueeze(1), 0.0)
+        importance_scores = attention_scores.abs().mean(dim=1)  # [batch_heads, seq_length]
+        del attention_scores
 
-            # Stable importance metric
-            importance += torch.mean(torch.abs(scores), dim=1)
-
-        # Always keep sink tokens
+        # Enforce preservation of attention sinks (initial tokens)
         if self.sink_size > 0:
-            importance[:, :self.sink_size] = 1e10
+            importance_scores[:, :self.sink_size] = float("inf")
+        importance_scores = importance_scores.masked_fill(~valid_mask, float("-inf"))
 
-        importance = importance.masked_fill(~valid_mask, float("-inf"))
+        # 5) Top-K selection to form compressed basis ---
+        _, top_indices = torch.topk(importance_scores, compressed_length, dim=-1, sorted=False)
+        top_indices = top_indices.sort(dim=-1).values  # Maintain chronological order
+        gather_indices = top_indices.unsqueeze(-1).expand(-1, -1, head_dim)
 
-        # ------------------------------------------------------------
-        # 4) Top‑K selection
-        # ------------------------------------------------------------
-        _, topk_idx = torch.topk(importance, budget, dim=-1, sorted=False)
-        batch_idx = torch.arange(BH, device=device).unsqueeze(-1)
-        C_k = K_flat[batch_idx, topk_idx]  # [BH, Lc, D]
+        # Extract selected keys and values to form K_c and initial V_c
+        compressed_keys = torch.gather(
+            key_states.reshape(batch_heads, seq_length, head_dim),
+            1, gather_indices
+        ).float()  # [batch_heads, L_c, head_dim]
 
-        # ------------------------------------------------------------
-        # 5) Compute original log‑mass via streaming log‑sum‑exp
-        # ------------------------------------------------------------
-        def online_lse(cur, new):
-            """
-            Numerically stable streaming log‑sum‑exp:
-                cur = logsumexp(previous_chunks)
-                new = scores for current chunk
-            """
-            m1 = cur
-            m2, _ = torch.max(new, dim=-1)
-            m = torch.maximum(m1, m2)
-            return m + torch.log(
-                torch.exp(m1 - m) +
-                torch.sum(torch.exp(new - m.unsqueeze(-1)), dim=-1)
+        compressed_values_init = torch.gather(
+            value_states.reshape(batch_heads, seq_length, head_dim),
+            1, gather_indices
+        ).float()
+
+        # 6) Streaming log-mass calculation for original attention (log Z_orig) ---
+        log_mass_original = torch.full((batch_heads, num_queries), float("-inf"), device=device, dtype=torch.float32)
+
+        for start in range(0, seq_length, self.logmass_l_chunk):
+            end = min(seq_length, start + self.logmass_l_chunk)
+            chunk_scores = torch.bmm(
+                queries,
+                key_states.reshape(batch_heads, seq_length, head_dim)[:, start:end, :].float().transpose(-1, -2)
+            ) * scale
+
+            if flat_mask is not None:
+                chunk_scores = chunk_scores.masked_fill(~valid_mask[:, start:end].unsqueeze(1), float("-inf"))
+
+            log_mass_original = self._online_logsumexp(log_mass_original, chunk_scores)
+            del chunk_scores
+
+        # 7) Compressed log-mass and bias β alignment ---
+        compressed_scores = torch.bmm(queries, compressed_keys.transpose(-1, -2)) * scale
+        log_mass_compressed = torch.logsumexp(compressed_scores, dim=-1)
+
+        # Compute bias β to compensate for mass loss during compression
+        log_mass_difference = (log_mass_original - log_mass_compressed).nan_to_num_(0.0)
+        beta_per_head = log_mass_difference.median(dim=1, keepdim=True).values  # [batch_heads, 1]
+
+        # 8) Adaptive regularization parameters ---
+        severity_factor = max(self.compression_ratio / self.lambda_ratio_ref, 1.0)
+        lambda_base = self.lambda_scale_factor / (severity_factor * severity_factor)
+
+        # Pre-allocate output container for compressed values
+        compressed_values = torch.empty((batch_heads, compressed_length, head_dim), device=device, dtype=dtype)
+        identity_matrix = torch.eye(compressed_length, device=device, dtype=torch.float32)
+
+        # Reshape mask for attention computation if needed
+        if attention_mask is not None:
+            if attention_mask.dim() == 2:
+                current_mask = attention_mask.view(batch_size, 1, 1, seq_length)
+            elif attention_mask.dim() == 3:
+                current_mask = attention_mask.unsqueeze(2)
+            else:
+                current_mask = attention_mask
+        else:
+            current_mask = None
+
+        # --- Memory-efficient head-wise processing ---
+        # Process each head independently to avoid storing large Gram matrices for all heads simultaneously
+        for head_idx in range(batch_heads):
+            # Map flat head index back to batch and head indices
+            batch_idx = head_idx // num_heads
+            head_idx_in_batch = head_idx % num_heads
+
+            # Initialize Gram matrix G_i and projection matrix P_i for current head
+            gram_matrix_i = torch.zeros((compressed_length, compressed_length), device=device, dtype=torch.float32)
+            projection_matrix_i = torch.zeros((compressed_length, head_dim), device=device, dtype=torch.float32)
+
+            # Process reference queries in chunks
+            for query_start in range(0, num_queries, self.chunk_R):
+                query_end = min(num_queries, query_start + self.chunk_R)
+
+                # 1) Compute weight matrix W_chunk for current head and query chunk
+                # W = softmax(scores_comp + β) ∈ [R_chunk, L_c]
+                scores_chunk = compressed_scores[head_idx:head_idx + 1, query_start:query_end, :].float()
+                scores_chunk = scores_chunk + beta_per_head[head_idx].float()
+                weight_matrix_chunk = torch.softmax(scores_chunk, dim=-1).squeeze(0)  # [R_chunk, L_c]
+
+                # 2) Incrementally accumulate Gram matrix: G_i += W_chunk^T @ W_chunk
+                # Using addmm_ for in-place accumulation to save memory
+                gram_matrix_i.addmm_(weight_matrix_chunk.t(), weight_matrix_chunk)
+
+                # 3) Reconstruct original attention output Y_chunk using SDPA
+                if current_mask is not None:
+                    # Extract mask for current batch, head, and query chunk
+                    mask_chunk = current_mask[batch_idx:batch_idx + 1, head_idx_in_batch:head_idx_in_batch + 1,
+                    query_start:query_end, :]
+                else:
+                    mask_chunk = None
+
+                # Compute Y_chunk = Attention(Q_chunk, K, V)
+                y_chunk = F.scaled_dot_product_attention(
+                    queries[head_idx:head_idx + 1, query_start:query_end, :].view(1, 1, -1, head_dim).to(
+                        key_states.dtype),
+                    key_states[batch_idx:batch_idx + 1, head_idx_in_batch:head_idx_in_batch + 1, :, :],
+                    value_states[batch_idx:batch_idx + 1, head_idx_in_batch:head_idx_in_batch + 1, :, :],
+                    attn_mask=mask_chunk
+                ).reshape(-1, head_dim)
+
+                # 4) Incrementally accumulate projection matrix: P_i += W_chunk^T @ Y_chunk
+                projection_matrix_i.addmm_(weight_matrix_chunk.t(), y_chunk.float())
+
+                # Clean up chunk tensors
+                del weight_matrix_chunk, y_chunk, scores_chunk
+
+            # 5) Compute adaptive regularization strength for current head
+            gram_trace_i = torch.diagonal(gram_matrix_i).sum()
+            regularization_strength = (lambda_base * gram_trace_i / compressed_length) + self.eps
+
+            # 6) Solve ridge regression for current head: (G_i + λI) V_opt_i = P_i
+            compressed_values[head_idx] = self._solve_ridge(
+                gram_matrix=gram_matrix_i,
+                projection_matrix=projection_matrix_i,
+                identity=identity_matrix,
+                regularization=regularization_strength,
+                dtype=dtype
             )
 
-        log_mass_orig = torch.full((BH, R), float("-inf"), device=device)
-        l_chunk = self.logmass_l_chunk or L
+            # Free head-specific tensors
+            del gram_matrix_i, projection_matrix_i
 
-        for l_start in range(0, L, l_chunk):
-            l_end = min(L, l_start + l_chunk)
-            K_l = K_flat[:, l_start:l_end, :]
-            scores_l = torch.bmm(Q_flat, K_l.transpose(-1, -2)) * scale
+        # 9) Package outputs ---
+        del compressed_scores
 
-            if mask_flat is not None:
-                scores_l = scores_l.masked_fill(
-                    ~valid_mask[:, l_start:l_end].unsqueeze(1),
-                    float("-inf"),
-                )
+        compressed_keys = compressed_keys.view(batch_size, num_heads, compressed_length, head_dim).to(dtype)
+        compressed_values = compressed_values.view(batch_size, num_heads, compressed_length, head_dim)
 
-            log_mass_orig = online_lse(log_mass_orig, scores_l)
-        if mask_flat is not None:
-            sdpa_mask = valid_mask.view(B, H_kv, L).unsqueeze(2).expand(-1, -1, R, -1)
-        else:
-            sdpa_mask = None
+        # β is applied as additive bias to attention scores in later layers
+        log_bias = beta_per_head.expand(batch_heads, compressed_length).reshape(batch_size, num_heads,
+                                                                                compressed_length).to(dtype)
 
-        Y_full = F.scaled_dot_product_attention(
-            Q_flat.view(B, H_kv, R, D),
-            K_f32,
-            V_f32,
-            attn_mask=sdpa_mask,
-        ).reshape(BH, R, D)
-
-        # ------------------------------------------------------------
-        # 6) Compute compressed log‑mass
-        # ------------------------------------------------------------
-        log_mass_comp = torch.empty(BH, R, device=device)
-        for i in range(BH):
-            Qi = Q_flat[i]
-            Cki = C_k[i]
-            scores_ci = (Qi @ Cki.transpose(-1, -2)) * scale
-            log_mass_comp[i] = torch.logsumexp(scores_ci, dim=-1)
-
-        # β = median(log_mass_orig − log_mass_comp)
-        diff = log_mass_orig - log_mass_comp
-        beta_per_head = diff.median(dim=1, keepdim=True).values
-        beta = beta_per_head.expand(-1, budget).view(B, H_kv, budget).to(dtype)
-
-        # ------------------------------------------------------------
-        # 7) Ridge regression to fit compressed values C_v
-        # ------------------------------------------------------------
-        C_v = torch.empty(BH, budget, D, device=device)
-
-        # Compression severity controls λ decay
-        severity = max(self.compression_ratio / self.lambda_ratio_ref, 1.0)
-        effective_lambda = self.lambda_scale_factor / (severity * severity)
-
-        I = None
-
-        for i in range(BH):
-            Qi = Q_flat[i]
-            Cki = C_k[i]
-
-            # Attention weights under compressed keys
-            s_i = (Qi @ Cki.transpose(-1, -2)) * scale
-            b_i = beta_per_head[i]
-            W = torch.softmax(s_i + b_i.unsqueeze(0), dim=-1)
-
-            Xt = W.transpose(-1, -2)
-            XtX = Xt @ W
-            XtY = Xt @ Y_full[i]
-
-            if I is None or I.size(0) != budget:
-                I = torch.eye(budget, device=device)
-
-            trace = torch.diagonal(XtX).sum()
-            lam = effective_lambda * trace / max(budget, 1) + 1e-9
-
-            # Solve (XtX + λI) C_v = XtY
-            C_v[i] = torch.linalg.solve(XtX + lam * I, XtY)
-
-        # Reshape back to [B, H_kv, Lc, D]
-        C_k = C_k.view(B, H_kv, budget, D).to(dtype)
-        C_v = C_v.view(B, H_kv, budget, D).to(dtype)
-
-        return C_k, C_v, beta
+        return compressed_keys, compressed_values, log_bias
 
 
 def compact_attention(q, k, v, beta, attn_mask=None):
@@ -403,7 +457,7 @@ class Attention(nn.Module):
                 ref_len = min(self.ref_len, q.size(2))
                 q_ref = q[:, :, -ref_len:, :].mean(dim=(0, 1))
 
-                C_k, C_v, beta = self.compactor.compact(old_k, old_v, q_ref, attn_mask=old_mask)
+                C_k, C_v, beta = self.compactor.compact(old_k, old_v, q_ref, attention_mask=old_mask)
                 beta = beta * self.beta_scale
 
                 C_k_full = self.repeat_kv(C_k)
@@ -549,7 +603,7 @@ def test_attention_usage():
     )
 
     compactor = FastKVCompaction(compression_ratio=20.0)
-    C_k, C_v, beta = compactor.compact(K, V, Q_ref, attn_mask=attn_mask)
+    C_k, C_v, beta = compactor.compact(K, V, Q_ref, attention_mask=attn_mask)
 
     compact_mask = torch.ones(
         B, H, C_k.size(2), dtype=torch.bool, device=device
@@ -606,7 +660,7 @@ def test_segmented_compaction():
 
     compactor = FastKVCompaction(compression_ratio=20.0)
 
-    C_k, C_v, beta = compactor.compact(old_K, old_V, Q_ref, attn_mask=old_mask)
+    C_k, C_v, beta = compactor.compact(old_K, old_V, Q_ref, attention_mask=old_mask)
 
     # Concatenate compressed old tokens + new tokens
     K_full = torch.cat([C_k, new_K], dim=2)
@@ -634,6 +688,8 @@ def test_fastkv_compaction():
     configs = [
         (1, 32, 32768, 128, 10.0),
         (1, 32, 65536, 128, 10.0),
+        (1, 32, 32768, 128, 15.0),
+        (1, 32, 65536, 128, 15.0),
         (1, 32, 32768, 128, 20.0),
         (1, 32, 65536, 128, 20.0),
     ]
@@ -660,7 +716,7 @@ def test_fastkv_compaction():
             torch.cuda.synchronize()
         start = time.time()
 
-        C_k, C_v, beta = compactor.compact(K, V, Q_ref, attn_mask=attn_mask)
+        C_k, C_v, beta = compactor.compact(K, V, Q_ref, attention_mask=attn_mask)
 
         if torch.cuda.is_available():
             torch.cuda.synchronize()
